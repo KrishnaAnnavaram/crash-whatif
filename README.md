@@ -512,9 +512,8 @@ All numbers come from the **synthetic** `signal` data (6,000 rows, seed 42). The
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **41 passed**, 3 skipped (extras `imbalance` and `dice` absent) | `pytest -q` |
+| Unit tests (CI installs only `.[dev]`) | **41 passed**, 3 skipped (extras `imbalance` and `dice` absent) | `pytest -q` |
 | Unit tests with the extras | **44 passed** | `pip install -e ".[dev,imbalance,dice]"`, `pytest -q` |
-| Expected CI (fresh venv, `pip install -e ".[dev]"`) | **41 passed**, 3 skipped | `.github/workflows/ci.yml` |
 | Test ROC AUC (1,200 rows) | `logreg` 0.722 [0.687, 0.750] · `linear_svm` 0.721 · `random_forest` 0.700 · `gradient_boosting` 0.677 · `make_only` 0.566 · `majority` 0.500 | `crash-whatif report` |
 | Probability quality | ECE: `linear_svm` 0.024, `random_forest` 0.083, `logreg` 0.214 (class weights) | `crash-whatif report` |
 | Signal audit (signal data) | AUC `make` only 0.566, without `make` 0.714, all columns 0.722, `make_dominates` false | `crash-whatif audit` |
