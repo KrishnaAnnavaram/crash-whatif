@@ -1,0 +1,26 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# data, models and reports are never committed
+/data/*
+!/data/README.md
+/models/
+/reports/
+*.db
+*.sqlite
+*.sqlite3
+*.joblib
+*.pkl
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/

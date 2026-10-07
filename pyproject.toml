@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crash-whatif"
+version = "0.1.0"
+description = "Explain crash severity with counterfactuals (DiCE)"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Krishna Annavaram" }]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scikit-learn>=1.4",
+]
+
+[project.optional-dependencies]
+imbalance = ["imbalanced-learn>=0.12"]
+dice = ["dice-ml>=0.11"]
+all = ["crash-whatif[imbalance,dice]"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+crash-whatif = "crash_whatif.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
