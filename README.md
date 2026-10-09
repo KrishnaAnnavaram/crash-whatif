@@ -74,6 +74,7 @@ This README is the **one location that explains all of crash-whatif**. It gives 
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one query](#42-the-life-cycle-of-one-query)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 📋 [The crash schema](#5-the-crash-schema)
 6. 🧪 [The synthetic generator](#6-the-synthetic-generator)
 7. 🔵 [The model pipelines](#7-the-model-pipelines)
@@ -142,6 +143,54 @@ flowchart LR
 | Report | `src/crash_whatif/report.py` | Text tables, `report.md` and `report.json` |
 | CLI | `src/crash_whatif/cli.py` | The `crash-whatif` command with 9 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry point"]
+        CLI["cli.py<br/>crash-whatif command"]
+        CFG["config.py<br/>load_dotenv, Settings.from_env"]
+    end
+    subgraph DATAIN["Data in"]
+        SYN["synthetic.py<br/>make_crashes"]
+        SCH["schema.py<br/>validate, coerce, make_target"]
+        SPL["split.py<br/>stratified_split"]
+    end
+    subgraph FITG["Fit and evaluate"]
+        ST["study.py<br/>prepare, fit_all, signal_audit,<br/>counterfactual_benchmark"]
+        MOD["models.py<br/>build_pipeline, fit_model"]
+        EVA["evaluate.py<br/>binary_metrics, three_class_report"]
+        IMP["importance.py<br/>auc_drop"]
+    end
+    subgraph EXPL["Counterfactuals"]
+        CF["counterfactuals.py<br/>FeatureSpace, RandomSearchCF"]
+        CFM["cf_metrics.py<br/>Plausibility, query_metrics, summarize"]
+        DICE["dice_adapter.py<br/>DiceCF, optional"]
+    end
+    REP["report.py<br/>text tables, write"]
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> SCH
+    CLI --> ST
+    CLI --> REP
+    CLI -- "train, counterfactual, demo" --> CF
+    ST --> SCH
+    ST --> SPL
+    ST --> MOD
+    ST --> EVA
+    ST --> IMP
+    ST --> CF
+    ST --> CFM
+    EVA --> MOD
+    IMP --> MOD
+    CF --> MOD
+    CFM --> CF
+    CFM --> MOD
+    MOD --> SCH
+    DICE -. "same interface" .-> CF
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -180,6 +229,22 @@ crash-whatif/
 
 ### 3.1 Split first
 `study.prepare` validates the table and then splits it into train (60 %), validation (20 %) and test (20 %), stratified by severity. No step before the split learns from the data. The test part is never resampled, so each test row is a real row.
+
+```mermaid
+flowchart LR
+    RAW[/"Crash table"/] --> VAL["schema.validate"]
+    VAL --> SPL["stratified_split with the seed:<br/>60 / 20 / 20 %, by severity"]
+    SPL --> TR["train part"]
+    SPL --> VA["validation part"]
+    SPL --> TE["test part, real rows only"]
+    TR --> FIT["pipeline.fit: impute, optional resample,<br/>encode, classifier"]
+    TR --> FS["FeatureSpace.from_train,<br/>Plausibility"]
+    VA --> THR["choose_threshold"]
+    FIT --> THR
+    TE --> OUT[/"Metrics, importance, signal audit,<br/>counterfactual queries"/]
+    THR --> OUT
+    FS --> OUT
+```
 
 ### 3.2 All fit steps are pipeline steps
 The imputer, the optional resampler, the encoder, the scaler and the classifier are steps of one pipeline. `fit` gets only the training part. The resampler runs only in `fit`, so it never adds rows to the validation or test part.
@@ -227,6 +292,30 @@ flowchart TB
 
 ### 4.2 The life cycle of one query
 
+```mermaid
+stateDiagram-v2
+    state "Test row" as Row
+    state "Query, predicted severe" as Query
+    state "Search with k changed columns" as Search
+    state "Valid copies" as Valid
+    state "Sparsified copies" as Sparse
+    state "Counterfactuals chosen" as Chosen
+    state "Not found" as NotFound
+    state "Query metrics" as Scored
+    [*] --> Row
+    Row --> [*]: predicted not severe, not used
+    Row --> Query: predicted severe, sampled with the seed
+    Query --> Search: k = 1, 300 copies
+    Search --> Search: fewer than 3 valid copies, k + 1, max 3
+    Search --> Valid: 3 or more valid copies, or k = 3
+    Valid --> NotFound: no valid copy
+    Valid --> Sparse: sort by distance, put back each change that is not necessary
+    Sparse --> Chosen: up to 3 with different changes
+    Chosen --> Scored: query_metrics
+    NotFound --> Scored: found 0, validity 0
+    Scored --> [*]
+```
+
 1. The benchmark selects a test row that the model predicts as severe.
 2. `RandomSearchCF` makes 300 copies and changes 1 random actionable column in each copy.
 3. The model predicts each copy. The copies with "not severe" are valid.
@@ -235,11 +324,69 @@ flowchart TB
 6. The search keeps 3 counterfactuals with different changes.
 7. `query_metrics` calculates the five metrics for the query.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor AN as Analyst
+    participant CLI as cli.py
+    participant ST as study.py
+    participant MOD as models.py
+    participant EV as evaluate.py and importance.py
+    participant CF as RandomSearchCF
+    participant RP as report.py
+    participant FS as reports folder
+
+    AN->>CLI: crash-whatif report --queries 50 --out reports
+    CLI->>CLI: load_dotenv, Settings.from_env
+    CLI->>CLI: read --csv or CRASH_WHATIF_DATA, else make_crashes
+    CLI->>ST: prepare(raw, settings)
+    ST->>ST: validate, make_target, stratified_split
+    CLI->>ST: fit_all for the 6 models
+    loop each model
+        ST->>MOD: fit_model on train, choose_threshold on val
+    end
+    CLI->>ST: metrics_table, signal_audit, importance_tables
+    ST->>EV: binary_metrics and auc_drop on test
+    CLI->>ST: counterfactual_benchmark
+    loop each of 4 models and each query
+        ST->>CF: generate(row, n_cfs 3, desired 0)
+        CF-->>ST: CFResult
+    end
+    CLI->>ST: three_class
+    CLI->>RP: write(result, out, source)
+    RP->>FS: report.md and report.json
+    CLI-->>AN: metric, importance and benchmark tables
+```
+
 ---
 
 ## 5. The crash schema
 
 **Purpose.** Accept the public column names, clean each column and give one target.
+
+```mermaid
+flowchart TD
+    IN[/"Crash table"/] --> REN["rename_source:<br/>public names to project names"]
+    REN --> REQ{"make, vehicle_type and<br/>severity present?"}
+    REQ -- "no" --> ERR1[/"SchemaError"/]
+    REQ -- "yes" --> CO["coerce: to_numeric, to_flag,<br/>clean_category"]
+    CO --> MISS{"Required value missing?"}
+    MISS -- "yes" --> DROP["Drop the row,<br/>count the reason"]
+    MISS -- "no" --> SEV{"Severity minor,<br/>moderate or severe?"}
+    SEV -- "no" --> DROP
+    SEV -- "yes" --> RNG{"Number outside<br/>its range?"}
+    RNG -- "yes" --> NAN["Set NaN, add a warning"]
+    RNG -- "no" --> SH
+    NAN --> SH{"Feature missing in<br/>more than 20 % of rows?"}
+    SH -- "yes" --> WARN["Add a warning"]
+    SH -- "no" --> EMPTY
+    WARN --> EMPTY{"Rows left?"}
+    EMPTY -- "no" --> ERR2[/"SchemaError"/]
+    EMPTY -- "yes" --> OUT[/"Clean table and ValidationReport<br/>with class counts"/]
+    OUT --> TGT["make_target: binary 1 for severe,<br/>or three classes 0, 1, 2"]
+```
 
 **Procedure**
 
@@ -268,6 +415,22 @@ flowchart TB
 ## 6. The synthetic generator
 
 **Purpose.** Give a crash table where the true causes are known.
+
+```mermaid
+flowchart TD
+    IN[/"n 6000, seed, mode"/] --> MODE{"mode signal<br/>or make_rule?"}
+    MODE -- "other" --> ERR[/"ValueError"/]
+    MODE -- "yes" --> DRAW["Draw make, type, rating, airbags,<br/>flags, weather, road, time, age, location"]
+    DRAW --> LAB{"mode"}
+    LAB -- "signal" --> LOGIT["true_logit: sum of the effects<br/>in LOGIT_EFFECTS"]
+    LOGIT --> PS["severe if a uniform draw is below<br/>the logistic probability"]
+    LAB -- "make_rule" --> RULE["severe if make is not Maruti Suzuki,<br/>2 % flips"]
+    PS --> MIN["1 % of the other rows: minor,<br/>the rest: moderate"]
+    RULE --> MIN
+    MIN --> NOISE["Add the no-effect columns: year, engine,<br/>sizes, tcs, tpms, day, gender"]
+    NOISE --> MESSY["Messy values: flags as 1.0, True, 0.0,<br/>False or blank, the text nan, blank gender"]
+    MESSY --> OUT[/"Table with the public column names<br/>and Crash_severity"/]
+```
 
 **Procedure (`signal` mode)**
 
@@ -302,6 +465,28 @@ flowchart TB
 
 **Purpose.** Fit each model with the same preprocessing on the training rows only.
 
+```mermaid
+flowchart TD
+    IN[/"Model name, train rows,<br/>CRASH_WHATIF_RESAMPLE"/] --> COLS{"make_only?"}
+    COLS -- "yes" --> C1["Columns: make"]
+    COLS -- "no" --> C2["Columns: all 24 features"]
+    C1 --> IMP["impute: median, most frequent,<br/>constant missing"]
+    C2 --> IMP
+    IMP --> RS{"Resample mode"}
+    RS -- "none or class_weight,<br/>or model majority" --> ENC
+    RS -- "oversample" --> ROS["RandomOverSampler<br/>in an imblearn Pipeline"]
+    RS -- "smotenc" --> SMN["SMOTENC on the nominal columns,<br/>else RandomOverSampler"]
+    ROS --> ENC["encode: StandardScaler, passthrough,<br/>OneHotEncoder that ignores unknown values"]
+    SMN --> ENC
+    ENC --> CLF["build_classifier: balanced weights<br/>with the class_weight mode"]
+    CLF --> FIT["pipeline.fit on train"]
+    FIT --> THQ{"Model majority, or<br/>one class in val?"}
+    THQ -- "yes" --> T05["Threshold 0.5"]
+    THQ -- "no" --> THR["choose_threshold: best balanced accuracy<br/>on val, grid 0.05 to 0.95"]
+    T05 --> OUT[/"FittedModel: pipeline,<br/>threshold, columns"/]
+    THR --> OUT
+```
+
 | Step | Object | Notes |
 |---|---|---|
 | `impute` | `SimpleImputer`: median (numbers), most frequent (flags), `"missing"` (nominal) | pandas output, so the resampler sees column names |
@@ -329,6 +514,18 @@ flowchart TB
 
 **Purpose.** Measure each model on real test rows, and measure how much `make` alone explains.
 
+```mermaid
+flowchart LR
+    M[/"FittedModel and test rows"/] --> P["proba: P(severe)"]
+    P --> PRED["Prediction at the<br/>chosen threshold"]
+    P --> R1["ROC AUC, 300 bootstrap<br/>samples for the 95 % interval"]
+    P --> R2["PR AUC, Brier, log loss,<br/>ECE with 10 bins"]
+    PRED --> R3["Balanced accuracy, F1 macro,<br/>recall of each class"]
+    R1 --> OUT[/"binary_metrics row"/]
+    R2 --> OUT
+    R3 --> OUT
+```
+
 | Metric | Meaning |
 |---|---|
 | ROC AUC, with a 95 % bootstrap interval | Ranking quality, 300 bootstrap samples |
@@ -343,11 +540,42 @@ flowchart TB
 3. Fit a logistic pipeline on all columns.
 4. Set `make_dominates` to `true` if the AUC of `make` alone is above 0.9 and the AUC without `make` is below 0.6.
 
+```mermaid
+flowchart TD
+    TR[/"train and test parts"/] --> A1["logreg pipeline on make only"]
+    TR --> A2["logreg pipeline on all<br/>columns except make"]
+    TR --> A3["logreg pipeline on all columns"]
+    TR --> CT["Severity share by make<br/>in the train part"]
+    A1 --> U1["Test ROC AUC, make only"]
+    A2 --> U2["Test ROC AUC, without make"]
+    A3 --> U3[/"Test ROC AUC, all columns"/]
+    U1 --> D{"make only above 0.9 and<br/>without make below 0.6?"}
+    U2 --> D
+    D -- "yes" --> T[/"make_dominates true"/]
+    D -- "no" --> F[/"make_dominates false"/]
+    T --> HUMAN{{"HUMAN<br/>reads the audit before<br/>any claim about make"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
+```
+
 ---
 
 ## 9. Permutation importance
 
 **Purpose.** Rank the input columns by how much the model uses them.
+
+```mermaid
+flowchart LR
+    IN[/"FittedModel, test rows,<br/>n_repeats 10, seed"/] --> BASE["ROC AUC on the test rows"]
+    BASE --> COL["For each raw input column"]
+    COL --> SH["Shuffle the column with the seed,<br/>one-hot columns move together"]
+    SH --> AUC["ROC AUC again"]
+    AUC --> DROP["Drop: base AUC minus new AUC"]
+    DROP --> REP{"n_repeats done?"}
+    REP -- "no" --> SH
+    REP -- "yes" --> OUT[/"Mean and std of the drop,<br/>largest first"/]
+```
 
 **Procedure**
 
@@ -367,6 +595,25 @@ flowchart TB
 
 **Purpose.** Find small, permitted changes that make the model predict "not severe".
 
+```mermaid
+flowchart TD
+    TR[/"Train part, actionable columns"/] --> FSP["FeatureSpace.from_train: min and max,<br/>categories, MAD scale"]
+    Q[/"Query and desired class 0"/] --> K["k = 1"]
+    FSP --> K
+    K --> CAND["300 copies of the query: k random<br/>actionable columns get a value<br/>from the permitted range"]
+    CAND --> PRED["model.predict at the chosen threshold"]
+    PRED --> ENOUGH{"3 or more valid copies<br/>in total, or k = 3?"}
+    ENOUGH -- "no" --> NEXT["k + 1"]
+    NEXT --> CAND
+    ENOUGH -- "yes" --> ANY{"Any valid copy?"}
+    ANY -- "no" --> NF[/"CFResult, found false"/]
+    ANY -- "yes" --> SORT["Sort by MAD-scaled distance,<br/>keep the best 5 × n_cfs"]
+    SORT --> SP["_sparsify: put back each change<br/>that is not necessary"]
+    SP --> RANK["Sort by the number of changed<br/>columns, then by distance"]
+    RANK --> DIV["Keep up to n_cfs with<br/>different change sets"]
+    DIV --> OUT[/"CFResult, found true"/]
+```
+
 | Input | Output |
 |---|---|
 | A fitted model, a `FeatureSpace`, a query, `n_cfs` | A `CFResult` with up to `n_cfs` counterfactuals and a `found` flag |
@@ -385,9 +632,33 @@ flowchart TB
 
 `DiceCF` gives the same result type with the DiCE `random` method. DiCE uses the threshold 0.5 of the pipeline, not the chosen threshold.
 
+```mermaid
+flowchart LR
+    Q[/"Query"/] --> FILL["Fill missing values with<br/>the training median or mode"]
+    FILL --> DICE["dice_ml.Dice, method random:<br/>actionable columns, permitted ranges"]
+    DICE --> RES{"Counterfactuals returned?"}
+    RES -- "no, or UserConfigValidationException" --> NF[/"CFResult, found false"/]
+    RES -- "yes" --> OUT[/"CFResult, found true,<br/>threshold 0.5 of the pipeline"/]
+```
+
 ---
 
 ## 11. The counterfactual metrics
+
+The diagram shows how `counterfactual_benchmark` calculates the metrics for each model.
+
+```mermaid
+flowchart TD
+    IN[/"Study with fitted models,<br/>n_queries 50, n_cfs 3"/] --> FS["FeatureSpace.from_train<br/>and Plausibility on train"]
+    FS --> M["For each of logreg, linear_svm,<br/>random_forest, gradient_boosting"]
+    M --> SEL["Test rows predicted severe,<br/>sample n_queries with the seed"]
+    SEL --> GEN["RandomSearchCF.generate,<br/>seed + query number"]
+    GEN --> QM["query_metrics: found, validity, proximity,<br/>sparsity, diversity, plausibility"]
+    GEN --> CNT["Count each changed column"]
+    QM --> SUM["summarize: mean and 95 % bootstrap<br/>interval, 500 samples"]
+    SUM --> OUT[/"Benchmark of the model,<br/>with changed_columns"/]
+    CNT --> OUT
+```
 
 | Metric | Calculation | Better |
 |---|---|---|
@@ -469,7 +740,24 @@ CRASH_WHATIF_RESAMPLE=smotenc crash-whatif report --csv data/Crash_Data.csv
 | `audit` | Prints the signal audit as JSON |
 | `whatif` | Runs the counterfactual benchmark |
 | `counterfactual` | Prints counterfactuals for one crash with a saved model |
-| `report` | Writes `report.md` and `report.json` with all results and the three-class report |
+| `report` | Writes `report.md` and `report.json` with all results. The three-class report is in `report.json` only |
+
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> GEN["crash-whatif generate"]
+    GEN --> CSV[("data/crashes.csv")]
+    CSV --> VAL["validate --csv"]
+    CSV -- "--csv" --> TRN["train"]
+    INS -- "synthetic, no --csv" --> TRN
+    TRN --> MOD[("reports/models/<br/>model.joblib")]
+    MOD --> CFQ["counterfactual --model --input"]
+    CSV -- "--csv" --> ANA["explain, audit, whatif"]
+    CSV -- "--csv" --> REPC["report"]
+    REPC --> OUT[("reports/report.md,<br/>reports/report.json")]
+    INS --> DEMO["demo: prints only,<br/>writes no files"]
+```
 
 ### 13.4 Environment variables
 
@@ -479,11 +767,21 @@ CRASH_WHATIF_RESAMPLE=smotenc crash-whatif report --csv data/Crash_Data.csv
 | `CRASH_WHATIF_DATA` | Data source | CSV path when `--csv` is not given. Empty: synthetic data |
 | `CRASH_WHATIF_OUT` | `train`, `report` | Output folder. Default `reports` |
 | `CRASH_WHATIF_RESAMPLE` | Pipelines | `class_weight` (default), `none`, `oversample` or `smotenc` |
-| `CRASH_WHATIF_TARGET` | Settings | `binary` (default) or `three`. The `report` command always adds the three-class report |
+| `CRASH_WHATIF_TARGET` | Settings | `binary` (default) or `three`. The code checks the value, but no command uses it: the models always use the binary target. The `report` command always adds the three-class report |
 | `CRASH_WHATIF_N_QUERIES` | Benchmark | Queries for each model. Default 50 |
 | `CRASH_WHATIF_ACTIONABLE` | Counterfactuals | Comma-separated actionable columns. Default: the list in section 10 |
 
 The CLI reads a local `.env` file. A variable that is already in the environment wins. A value that is not valid stops the command with `error:`. crash-whatif needs no credentials.
+
+```mermaid
+flowchart LR
+    DOT[/".env file"/] --> LD["load_dotenv:<br/>sets only absent variables"]
+    PENV[/"Process environment"/] --> FE["Settings.from_env"]
+    LD --> FE
+    FE --> CHK{"Integers valid, RESAMPLE and<br/>TARGET known, N_QUERIES 1 or more,<br/>ACTIONABLE not empty?"}
+    CHK -- "yes" --> SET[/"Settings"/]
+    CHK -- "no" --> ERR[/"ConfigError: the CLI prints<br/>error: and returns 1"/]
+```
 
 ---
 
