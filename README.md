@@ -271,9 +271,9 @@ The benchmark generates counterfactuals for N real test rows for each model. It 
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
+flowchart TD
     SRC{"Data source"} -- "default" --> SYN["make_crashes (signal or make_rule)"]
-    SRC -- "--csv or CRASH_WHATIF_DATA" --> CSV["CSV file"]
+    SRC -- "--csv or CRASH_WHATIF_DATA" --> CSV[/"CSV file"/]
     SYN --> VAL["validate: names, flags, categories, labels"]
     CSV --> VAL
     VAL --> SPLIT["stratified_split: train 60 %, val 20 %, test 20 %"]
@@ -282,12 +282,19 @@ flowchart TB
     FIT --> THR
     THR --> EVAL["binary_metrics on test"]
     SPLIT -- "train, test" --> AUD["signal_audit"]
+    SPLIT -- "train, test" --> TC["three_class_report"]
     THR --> IMP["auc_drop on test"]
     THR --> CF["counterfactual_benchmark on N test rows"]
-    EVAL --> REP["report.md, report.json"]
+    THR -- "train command" --> MOD[("models folder<br/>one .joblib for each model")]
+    EVAL --> REP[/"report.md, report.json"/]
     AUD --> REP
     IMP --> REP
     CF --> REP
+    TC --> REP
+    REP --> HUMAN{{"HUMAN<br/>reads the signal audit before<br/>any claim about make"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one query
